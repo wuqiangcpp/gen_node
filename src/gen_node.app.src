@@ -1,0 +1,10 @@
+{application, gen_node, [
+    {description, "General Node - Gossip-based distributed node library"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib]},
+    {env, []},
+    {modules, [gen_node]},
+    {licenses, ["MIT"]},
+    {maintainers, []}
+]}.
