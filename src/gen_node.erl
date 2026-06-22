@@ -267,52 +267,59 @@ handle_info({gossip_sync, _, _, _}, #gen_node_state{gossip_enabled = false} = St
 handle_info({gossip_sync, FromPid, RemoteActive, SendTS}, State) ->
     CT = erlang:system_time(millisecond),
     Self = self(),
-    %% Update FromPid in active view (or add if missing)
     Act0 = State#gen_node_state.active_peers,
-    Act1 = case maps:find(FromPid, Act0) of
-        {ok, Info} -> Act0#{FromPid => Info#peer_info{last_seen = CT, status = alive,
-                                                       heartbeat = Info#peer_info.heartbeat + 1}};
-        error -> Act0
+    Pas0 = State#gen_node_state.passive_peers,
+    {Act1, Pas1} = case maps:find(FromPid, Act0) of
+        {ok, Info} ->
+            UpdInfo = Info#peer_info{last_seen = CT, status = alive,
+                                     heartbeat = Info#peer_info.heartbeat + 1},
+            {Act0#{FromPid => UpdInfo}, Pas0};
+        error ->
+            Info = #peer_info{status = alive, heartbeat = 0,
+                              incarnation = erlang:system_time(second), last_seen = CT},
+            try_promote(FromPid, Info, Act0, Pas0, State)
     end,
     %% Unknown peers from remote active → add to passive only
-    Pas0 = State#gen_node_state.passive_peers,
-    Pas1 = maps:fold(fun(Pid, _, P) ->
+    Pas2 = maps:fold(fun(Pid, _, P) ->
         case Pid =:= Self orelse maps:is_key(Pid, Act1) orelse maps:is_key(Pid, P) of
             true -> P;
             false ->
-                CT = erlang:system_time(millisecond),
                 P#{Pid => #peer_info{status = alive, heartbeat = 0,
                                      incarnation = erlang:system_time(second),
                                      last_seen = CT}}
         end
-    end, Pas0, RemoteActive),
-    Pas2 = maps:remove(Self, Pas1),
+    end, Pas1, RemoteActive),
+    Pas3 = maps:remove(Self, Pas2),
     FromPid ! {gossip_sync_reply, Self, Act1, SendTS},
-    {noreply, State#gen_node_state{active_peers = Act1, passive_peers = trim_passive(Pas2, State)}};
+    {noreply, State#gen_node_state{active_peers = Act1, passive_peers = trim_passive(Pas3, State)}};
 handle_info({gossip_sync_reply, _, _, _}, #gen_node_state{gossip_enabled = false} = State) ->
     {noreply, State};
 handle_info({gossip_sync_reply, FromPid, RemoteActive, _SendTS}, State) ->
     CT = erlang:system_time(millisecond),
     Self = self(),
     Act0 = State#gen_node_state.active_peers,
-    Act1 = case maps:find(FromPid, Act0) of
-        {ok, Info} -> Act0#{FromPid => Info#peer_info{last_seen = CT, status = alive,
-                                                       heartbeat = Info#peer_info.heartbeat + 1}};
-        error -> Act0
-    end,
     Pas0 = State#gen_node_state.passive_peers,
-    Pas1 = maps:fold(fun(Pid, _, P) ->
+    {Act1, Pas1} = case maps:find(FromPid, Act0) of
+        {ok, Info} ->
+            UpdInfo = Info#peer_info{last_seen = CT, status = alive,
+                                     heartbeat = Info#peer_info.heartbeat + 1},
+            {Act0#{FromPid => UpdInfo}, Pas0};
+        error ->
+            Info = #peer_info{status = alive, heartbeat = 0,
+                              incarnation = erlang:system_time(second), last_seen = CT},
+            try_promote(FromPid, Info, Act0, Pas0, State)
+    end,
+    Pas2 = maps:fold(fun(Pid, _, P) ->
         case Pid =:= Self orelse maps:is_key(Pid, Act1) orelse maps:is_key(Pid, P) of
             true -> P;
             false ->
-                CT2 = erlang:system_time(millisecond),
                 P#{Pid => #peer_info{status = alive, heartbeat = 0,
                                      incarnation = erlang:system_time(second),
-                                     last_seen = CT2}}
+                                     last_seen = CT}}
         end
-    end, Pas0, RemoteActive),
-    Pas2 = maps:remove(Self, Pas1),
-    {noreply, State#gen_node_state{active_peers = Act1, passive_peers = trim_passive(Pas2, State)}};
+    end, Pas1, RemoteActive),
+    Pas3 = maps:remove(Self, Pas2),
+    {noreply, State#gen_node_state{active_peers = Act1, passive_peers = trim_passive(Pas3, State)}};
 
 %% join: new node sends gossip_join to seed
 handle_info({gossip_join, _}, #gen_node_state{gossip_enabled = false} = State) ->
