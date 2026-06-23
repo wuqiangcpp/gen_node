@@ -2,3 +2,4 @@ _build/
 erl_crash.dump
 *.swp
 .DS_Store
+*.html

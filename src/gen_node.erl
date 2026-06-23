@@ -33,6 +33,8 @@
 -export([broadcast/2, gossip/2, ask/4]).
 -export([join/2, leave/1, peers/1]).
 -export([register_name/2, whereis_name/1]).
+-export([local_peers/0]).
+-export([start_tree/5, start_line/4, start_grid/5]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -154,12 +156,14 @@ init([Mod, Args, Options]) ->
 
 handle_call({call, Request}, From, State) ->
     try Mod = State#gen_node_state.mod,
-        case Mod:handle_call(Request, From, State#gen_node_state.mod_state) of
-            {reply, Reply, NMS} -> {reply, Reply, State#gen_node_state{mod_state = NMS}};
-            {noreply, NMS} -> {noreply, State#gen_node_state{mod_state = NMS}};
-            {stop, R, Reply, NMS} -> {stop, R, Reply, State#gen_node_state{mod_state = NMS}};
-            {stop, R, NMS} -> {stop, R, State#gen_node_state{mod_state = NMS}}
-        end
+        put('$gn_peers', maps:keys(State#gen_node_state.active_peers)),
+        try case Mod:handle_call(Request, From, State#gen_node_state.mod_state) of
+                {reply, Reply, NMS} -> {reply, Reply, State#gen_node_state{mod_state = NMS}};
+                {noreply, NMS} -> {noreply, State#gen_node_state{mod_state = NMS}};
+                {stop, R, Reply, NMS} -> {stop, R, Reply, State#gen_node_state{mod_state = NMS}};
+                {stop, R, NMS} -> {stop, R, State#gen_node_state{mod_state = NMS}}
+            end
+        after erase('$gn_peers') end
     catch Class:Err:ST ->
         error_logger:error_msg("gen_node: handle_call ~p crashed ~p:~p~n~p~n",
             [Request, Class, Err, ST]),
@@ -174,7 +178,8 @@ handle_call({register_name, Name}, _From, State) ->
     end;
 handle_call({ask, Query, TTL, Timeout}, From, State) ->
     AskId = {erlang:unique_integer([positive]), node()},
-    Timer = erlang:send_after(Timeout, self(), {ask_timeout, AskId}),
+    InternalTimeout = erlang:max(Timeout - 50, 0),
+    Timer = erlang:send_after(InternalTimeout, self(), {ask_timeout, AskId}),
     Asks0 = State#gen_node_state.asks,
     Asks = Asks0#{AskId => {From, [], Timer}},
     Peers = maps:keys(State#gen_node_state.active_peers),
@@ -190,10 +195,12 @@ handle_call(_Request, _From, State) ->
 
 handle_cast({cast, Request}, State) ->
     try Mod = State#gen_node_state.mod,
-        case Mod:handle_cast(Request, State#gen_node_state.mod_state) of
-            {noreply, NMS} -> {noreply, State#gen_node_state{mod_state = NMS}};
-            {stop, R, NMS} -> {stop, R, State#gen_node_state{mod_state = NMS}}
-        end
+        put('$gn_peers', maps:keys(State#gen_node_state.active_peers)),
+        try case Mod:handle_cast(Request, State#gen_node_state.mod_state) of
+                {noreply, NMS} -> {noreply, State#gen_node_state{mod_state = NMS}};
+                {stop, R, NMS} -> {stop, R, State#gen_node_state{mod_state = NMS}}
+            end
+        after erase('$gn_peers') end
     catch Class:Err:ST ->
         error_logger:error_msg("gen_node: handle_cast ~p crashed ~p:~p~n~p~n",
             [Request, Class, Err, ST]),
@@ -461,6 +468,7 @@ handle_info({deliver_broadcast, FromPid, Data}, State) ->
     Mod = State#gen_node_state.mod,
     case erlang:function_exported(Mod, handle_broadcast, 3) of
         true ->
+            put('$gn_peers', maps:keys(State#gen_node_state.active_peers)),
             try case Mod:handle_broadcast(FromPid, Data, State#gen_node_state.mod_state) of
                     {noreply, NMS} -> {noreply, State#gen_node_state{mod_state = NMS}};
                     {stop, R, NMS} -> {stop, R, State#gen_node_state{mod_state = NMS}}
@@ -469,6 +477,8 @@ handle_info({deliver_broadcast, FromPid, Data}, State) ->
                 error_logger:error_msg("gen_node: handle_broadcast crashed ~p:~p~n~p~n",
                     [Class, Err, ST]),
                 {noreply, State}
+            after
+                erase('$gn_peers')
             end;
         false -> {noreply, State}
     end;
@@ -490,6 +500,7 @@ handle_info({gossip_forward, MsgId, OrigPid, Data, TTL}, State) ->
             Mod = NS0#gen_node_state.mod,
             NS = case erlang:function_exported(Mod, handle_gossip, 3) of
                 true ->
+                    put('$gn_peers', maps:keys(NS0#gen_node_state.active_peers)),
                     try case Mod:handle_gossip(OrigPid, Data, NS0#gen_node_state.mod_state) of
                             {noreply, NMS} -> NS0#gen_node_state{mod_state = NMS};
                             {stop, _, NMS} -> NS0#gen_node_state{mod_state = NMS}
@@ -498,6 +509,8 @@ handle_info({gossip_forward, MsgId, OrigPid, Data, TTL}, State) ->
                         error_logger:error_msg("gen_node: handle_gossip crashed ~p:~p~n~p~n",
                             [Class, Err, ST]),
                         NS0
+                    after
+                        erase('$gn_peers')
                     end;
                 false -> NS0
             end,
@@ -509,34 +522,49 @@ handle_info({gossip_forward, MsgId, OrigPid, Data, TTL}, State) ->
                 false -> {noreply, NS}
             end
     end;
-%% ask_forward / ask_reply / ask_timeout (same as before)
+%% ask_forward / ask_reply / ask_timeout
 handle_info({ask_forward, AskId, OrigPid, Query, TTL, FromHop}, State) ->
-    AR0 = State#gen_node_state.ask_routes,
-    AR = AR0#{AskId => FromHop},
-    St1 = State#gen_node_state{ask_routes = AR},
-    Mod = St1#gen_node_state.mod,
-    Self = self(),
-    St2 = case erlang:function_exported(Mod, handle_ask, 3) of
-        true ->
-            try case Mod:handle_ask(OrigPid, Query, St1#gen_node_state.mod_state) of
-                    {reply, Reply, NMS} ->
-                        send_ask_reply(OrigPid, Self, AskId, Reply, St1),
-                        St1#gen_node_state{mod_state = NMS};
-                    {noreply, NMS} -> St1#gen_node_state{mod_state = NMS}
-                end
-            catch Class:Err:ST ->
-                error_logger:error_msg("gen_node: handle_ask crashed ~p:~p~n~p~n",
-                    [Class, Err, ST]),
-                St1
-            end;
-        false -> St1
-    end,
-    APeers = maps:keys(St2#gen_node_state.active_peers),
-    case TTL > 0 andalso APeers =/= [] of
-        true -> FP = select_fanout_peers(APeers, St2#gen_node_state.fanout, FromHop),
-                _ = [P ! {ask_forward, AskId, OrigPid, Query, TTL - 1, Self} || P <- FP],
-                {noreply, St2};
-        false -> {noreply, St2}
+    Seen = State#gen_node_state.seen,
+    SeenCT = erlang:system_time(second),
+    case maps:is_key(AskId, Seen) of
+        true -> {noreply, State};
+        false ->
+            Seen1 = case map_size(Seen) >= ?SEEN_MAX_SIZE of
+                true -> clean_seen(Seen, State#gen_node_state.seen_ttl, SeenCT);
+                false -> Seen
+            end,
+            Seen2 = Seen1#{AskId => SeenCT},
+            StSeen = State#gen_node_state{seen = Seen2},
+            AR0 = StSeen#gen_node_state.ask_routes,
+            AR = AR0#{AskId => FromHop},
+            St1 = StSeen#gen_node_state{ask_routes = AR},
+            Mod = St1#gen_node_state.mod,
+            Self = self(),
+            St2 = case erlang:function_exported(Mod, handle_ask, 3) of
+                true ->
+                    put('$gn_peers', maps:keys(St1#gen_node_state.active_peers)),
+                    try case Mod:handle_ask(OrigPid, Query, St1#gen_node_state.mod_state) of
+                            {reply, Reply, NMS} ->
+                                send_ask_reply(OrigPid, Self, AskId, Reply, St1),
+                                St1#gen_node_state{mod_state = NMS};
+                            {noreply, NMS} -> St1#gen_node_state{mod_state = NMS}
+                        end
+                    catch Class:Err:ST ->
+                        error_logger:error_msg("gen_node: handle_ask crashed ~p:~p~n~p~n",
+                            [Class, Err, ST]),
+                        St1
+                    after
+                        erase('$gn_peers')
+                    end;
+                false -> St1
+            end,
+            APeers = maps:keys(St2#gen_node_state.active_peers),
+            case TTL > 0 andalso APeers =/= [] of
+                true -> FP = select_fanout_peers(APeers, St2#gen_node_state.fanout, FromHop),
+                        _ = [P ! {ask_forward, AskId, OrigPid, Query, TTL - 1, Self} || P <- FP],
+                        {noreply, St2};
+                false -> {noreply, St2}
+            end
     end;
 handle_info({ask_reply, AskId, OrigPid, ReplyPid, Reply}, State) ->
     Self = self(),
@@ -579,10 +607,12 @@ handle_info({gossip_ack, _Ref, FromPid}, State) ->
 %% default: pass to user callback
 handle_info(Info, State) ->
     try Mod = State#gen_node_state.mod,
-        case Mod:handle_info(Info, State#gen_node_state.mod_state) of
-            {noreply, NMS} -> {noreply, State#gen_node_state{mod_state = NMS}};
-            {stop, R, NMS} -> {stop, R, State#gen_node_state{mod_state = NMS}}
-        end
+        put('$gn_peers', maps:keys(State#gen_node_state.active_peers)),
+        try case Mod:handle_info(Info, State#gen_node_state.mod_state) of
+                {noreply, NMS} -> {noreply, State#gen_node_state{mod_state = NMS}};
+                {stop, R, NMS} -> {stop, R, State#gen_node_state{mod_state = NMS}}
+            end
+        after erase('$gn_peers') end
     catch Class:Err:ST ->
         error_logger:error_msg("gen_node: handle_info ~p crashed ~p:~p~n~p~n",
             [Info, Class, Err, ST]),
@@ -784,3 +814,53 @@ clean_seen(Seen, SeenTtl, CurrentTimeSec) ->
             maps:from_list(lists:sublist(Sorted, ?SEEN_MAX_SIZE div 2));
         false -> Filtered
     end.
+
+%%%===================================================================
+%%% Process context helpers
+%%%===================================================================
+
+local_peers() ->
+    case get('$gn_peers') of
+        undefined -> [];
+        P -> P
+    end.
+
+%%%===================================================================
+%%% Topology helpers
+%%%===================================================================
+
+%% Tree: M-ary of depth L
+start_tree(M, L, Mod, Args, Sym) when L > 1 ->
+    Children = [start_tree(M, L - 1, Mod, Args, Sym) || _ <- lists:seq(1, M)],
+    start_node(Children, Mod, Args, Sym);
+start_tree(_, 1, Mod, Args, Sym) ->
+    start_node([], Mod, Args, Sym).
+
+%% Line: chain of M nodes
+start_line(M, Mod, Args, Sym) ->
+    lists:foldl(fun(_, []) ->
+        [start_node([], Mod, Args, Sym)];
+    (_, [H | _] = L) ->
+        [start_node([H], Mod, Args, Sym) | L]
+    end, [], lists:seq(1, M)).
+
+%% Grid: M rows × N columns
+start_grid(M, N, Mod, Args, Sym) ->
+    lists:foldl(fun(_, []) -> start_line(M, Mod, Args, Sym);
+                   (_, FL) -> start_line_with_line(FL, Mod, Args, Sym)
+                end, [], lists:seq(1, N)).
+
+start_line_with_line(FL, Mod, Args, Sym) ->
+    lists:foldl(fun(F, []) ->
+        [start_node([F], Mod, Args, Sym)];
+    (F, [H | _] = L) ->
+        [start_node([H, F], Mod, Args, Sym) | L]
+    end, [], FL).
+
+start_node(Peers, Mod, Args, symmetric) ->
+    {ok, Pid} = start_link(Mod, Args, [{gossip_enabled, false}, {peers, Peers}]),
+    [join(Pid, [P]) || P <- Peers],
+    Pid;
+start_node(Peers, Mod, Args, asymmetric) ->
+    {ok, Pid} = start_link(Mod, Args, [{gossip_enabled, false}, {peers, Peers}]),
+    Pid.
