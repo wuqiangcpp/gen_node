@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en" data-kantu="1"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <title>
+      showgraph
+    </title>
+  <head>
+    <style type="text/css">
+      html,
+      body,
+      #mynetwork {
+          margin: 0px;
+          padding: 0px;
+	  height: 100%;
+	  width: 100%;	  
+      }
+
+      #mynetwork {
+          /* position: fixed; */
+          left: 0px;
+          top: 0px;
+          bottom: 0px;
+          border-right: 1px solid lightgray;
+          background: white;
+      }
+
+
+      #title {
+          margin-bottom: 5em;
+      }
+      .connected {
+	  color: green;
+      }
+
+      .disconnected {
+	  color: lightgray;
+      }      
+    </style>
+    <script type="text/javascript" src="./js/vis-network.min.js"></script>
+  </head>
+
+  <body>
+    <div id="connection" class="disconnected">&#9679;</div>
+    <div id="show" style="text-align:center"></div>    
+    <div id="mynetwork"></div>
+    <script type="text/javascript">
+      var ws;
+      function getRelations() {
+	  ws.send("get");
+      }
+      var container = document.getElementById("mynetwork");
+      var options = {};
+      var network= new vis.Network(container,{}, options);	  
+      function handle_msg(dataJson) {
+	  var directed = dataJson.info && dataJson.info.includes("(directed)");
+	  network.setOptions({edges: {arrows: {to: {enabled: directed}}}});
+	  var positions=network.getPositions();	  
+	  var nodes=dataJson.nodes.map(function(n){
+	      var pos=positions[n.id]||{};
+	      var color="#D2E5FF";
+	      return {id:n.id,label:n.id,x:pos.x,y:pos.y,color:color};
+	  });
+	  var links=dataJson.links.map(function(l){return {from:l.from, to:l.to};});
+	  var data = { nodes: new vis.DataSet(nodes), edges: new vis.DataSet(links) };
+	  document.getElementById("show").innerHTML = dataJson.info;
+	  network.setData(data);
+      }      
+      if ("WebSocket" in window) {
+	  // 打开一个 web socket
+	  ws = new WebSocket("ws://localhost:8081/ws");
+	  ws.onopen = function()
+	  {
+              var el = document.getElementById('connection');
+              el.classList.remove('disconnected');
+              el.classList.add('connected');
+              getRelations();
+	  };
+	  ws.onmessage = function (evt) {
+              var received_msg = evt.data;
+              var dataJson = JSON.parse(received_msg);
+              handle_msg(dataJson);
+	  };
+
+	  ws.onclose = function ()
+          {
+              var el = document.getElementById('connection');
+              el.classList.remove('connected');
+              el.classList.add('disconnected');
+          }
+      }
+      else{
+          // 浏览器不支持 WebSocket
+	  alert("您的浏览器不支持 WebSocket!");
+      }      
+      setInterval(function(){
+          getRelations();
+      },1000);
+
+    </script>
+  
+
+</body></html>

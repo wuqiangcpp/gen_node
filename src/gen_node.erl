@@ -80,7 +80,7 @@ broadcast(Pid, Data) -> gen_server:cast(Pid, {broadcast, Data}).
 gossip(Pid, Data) -> gen_server:cast(Pid, {gossip, Data}).
 -spec ask(pid(), term(), pos_integer(), timeout()) -> {ok, [{pid(), term()}]}.
 ask(Pid, Query, TTL, Timeout) ->
-    gen_server:call(Pid, {ask, Query, TTL, Timeout}).
+    gen_server:call(Pid, {ask, Query, TTL, Timeout}, Timeout + 100).
 
 -spec join(pid(), [pid() | {name, term()}]) -> ok.
 join(Pid, Peers) -> gen_server:cast(Pid, {join, Peers}).
@@ -122,11 +122,17 @@ init([Mod, Args, Options]) ->
             Self = self(),
             ResolvedPeers = lists:map(fun resolve_peer/1, PeersOption),
             ValidPeers = [P || P <- ResolvedPeers, is_pid(P), P =/= Self],
-            InitialActive = lists:foldl(fun(P, Acc) ->
-                Acc#{P => #peer_info{status = alive, heartbeat = 0,
-                                     incarnation = erlang:system_time(second),
-                                     last_seen = erlang:system_time(millisecond)}}
-            end, #{}, ValidPeers),
+            InitialActive = case GossipEnabled of
+                true ->
+                    _ = [P ! {gossip_join, Self} || P <- ValidPeers],
+                    #{};
+                false ->
+                    lists:foldl(fun(P, Acc) ->
+                        Acc#{P => #peer_info{status = alive, heartbeat = 0,
+                                             incarnation = erlang:system_time(second),
+                                             last_seen = erlang:system_time(millisecond)}}
+                    end, #{}, ValidPeers)
+            end,
             State = #gen_node_state{
                 mod = Mod, mod_state = ModState, name = Name,
                 active_peers = InitialActive, passive_peers = #{},
@@ -178,17 +184,27 @@ handle_call({register_name, Name}, _From, State) ->
     end;
 handle_call({ask, Query, TTL, Timeout}, From, State) ->
     AskId = {erlang:unique_integer([positive]), node()},
-    InternalTimeout = erlang:max(Timeout - 50, 0),
-    Timer = erlang:send_after(InternalTimeout, self(), {ask_timeout, AskId}),
-    Asks0 = State#gen_node_state.asks,
-    Asks = Asks0#{AskId => {From, [], Timer}},
-    Peers = maps:keys(State#gen_node_state.active_peers),
+    Timer = erlang:send_after(Timeout, self(), {ask_timeout, AskId}),
+    Self = self(),
+    Mod = State#gen_node_state.mod,
+    {SelfReply, St1} = case erlang:function_exported(Mod, handle_ask, 3) of
+        true ->
+            put('$gn_peers', maps:keys(State#gen_node_state.active_peers)),
+            try case Mod:handle_ask(Self, Query, State#gen_node_state.mod_state) of
+                    {reply, R, NMS} -> {[{Self, R}], State#gen_node_state{mod_state = NMS}};
+                    {noreply, NMS}  -> {[], State#gen_node_state{mod_state = NMS}}
+                end
+            catch _:_ -> {[], State}
+            after erase('$gn_peers') end;
+        false -> {[], State}
+    end,
+    Asks = (St1#gen_node_state.asks)#{AskId => {From, SelfReply, Timer}},
+    Peers = maps:keys(St1#gen_node_state.active_peers),
     case Peers of
-        [] -> {noreply, State#gen_node_state{asks = Asks}};
-        _ -> Self = self(),
-             FP = select_fanout_peers(Peers, State#gen_node_state.fanout, Self),
-             _ = [P ! {ask_forward, AskId, Self, Query, TTL, Self} || P <- FP],
-             {noreply, State#gen_node_state{asks = Asks}}
+        [] -> {noreply, St1#gen_node_state{asks = Asks}};
+        _  -> FP = select_fanout_peers(Peers, St1#gen_node_state.fanout, Self),
+              _ = [P ! {ask_forward, AskId, Self, Query, TTL, Self} || P <- FP],
+              {noreply, St1#gen_node_state{asks = Asks}}
     end;
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
@@ -829,14 +845,14 @@ local_peers() ->
 %%% Topology helpers
 %%%===================================================================
 
-%% Tree: M-ary of depth L
+%% Tree: M-ary of depth L, return root of the tree
 start_tree(M, L, Mod, Args, Sym) when L > 1 ->
     Children = [start_tree(M, L - 1, Mod, Args, Sym) || _ <- lists:seq(1, M)],
     start_node(Children, Mod, Args, Sym);
 start_tree(_, 1, Mod, Args, Sym) ->
     start_node([], Mod, Args, Sym).
 
-%% Line: chain of M nodes
+%% Line: chain of M nodes, return a list of all nodes
 start_line(M, Mod, Args, Sym) ->
     lists:foldl(fun(_, []) ->
         [start_node([], Mod, Args, Sym)];
@@ -844,7 +860,7 @@ start_line(M, Mod, Args, Sym) ->
         [start_node([H], Mod, Args, Sym) | L]
     end, [], lists:seq(1, M)).
 
-%% Grid: M rows × N columns
+%% Grid: M rows × N columns, return M nodes in last column
 start_grid(M, N, Mod, Args, Sym) ->
     lists:foldl(fun(_, []) -> start_line(M, Mod, Args, Sym);
                    (_, FL) -> start_line_with_line(FL, Mod, Args, Sym)

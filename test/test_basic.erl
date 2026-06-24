@@ -124,10 +124,11 @@ test() ->
     io:format("Test 9: ask / direct peer~n"),
     {ok, Ans9} = gen_node:ask(Pid1, whoami, 1, 2000),
     io:format("  answers = ~p~n", [Ans9]),
-    [{P9, N9}] = Ans9,
-    true = (P9 =:= Pid2),
-    true = is_atom(N9),
-    io:format("  got reply from ~p: ~p~n", [P9, N9]),
+    {_P9a, N9a} = lists:keyfind(Pid1, 1, Ans9),
+    {P9b, N9b} = lists:keyfind(Pid2, 1, Ans9),
+    true = is_atom(N9a),
+    true = is_atom(N9b),
+    io:format("  got reply from ~p: ~p~n", [P9b, N9b]),
     io:format("  PASSED~n~n"),
 
     %% Test 10: ask / noreply
@@ -141,9 +142,9 @@ test() ->
     io:format("Test 11: ask / echo~n"),
     {ok, Ans11} = gen_node:ask(Pid1, {echo, "hello"}, 1, 2000),
     io:format("  answers = ~p~n", [Ans11]),
-    [{P11, {echoed, "hello"}}] = Ans11,
-    true = (P11 =:= Pid2),
-    io:format("  got echoed from ~p~n", [P11]),
+    {P11a, {echoed, "hello"}} = lists:keyfind(Pid1, 1, Ans11),
+    {P11b, {echoed, "hello"}} = lists:keyfind(Pid2, 1, Ans11),
+    io:format("  got echoed from ~p and ~p~n", [P11a, P11b]),
     io:format("  PASSED~n~n"),
 
     %% Test 12: leave

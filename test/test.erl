@@ -4,7 +4,7 @@
 -export([init/1, handle_call/3, handle_cast/2,
          handle_broadcast/3, handle_gossip/3, handle_ask/3,
          handle_info/2, terminate/2]).
--export([test/0, test_gossip_disabled/0, test_all/0, discover/2, init_tree/5]).
+-export([test/0, test_gossip_disabled/0,  discover_topology/2]).
 
 -record(state, {
 }).
@@ -34,49 +34,84 @@ terminate(_Reason, _State) -> ok.
 
 
 test() ->
-    io:format("=== gen_node tests ===~n~n"),
+    io:format("=== gen_node gossip test ===~n~n"),
+    {ok, Seed} = gen_node:start_link(?MODULE, [], []),
+    gen_node:register_name(seed, Seed),
+    io:format("Seed: ~p~n", [Seed]),
+
+    Handlers = #{<<"get">> => {?MODULE, discover_topology, [[Seed], true]}},
+    gen_node_ws:start(Handlers, 8081),
+    io:format("WS server: http://localhost:8081/show.html~n"),
+
+    lists:foreach(fun(I) ->
+        timer:sleep(5000),
+        {ok, P} = gen_node:start_link(?MODULE, [], []),
+        gen_node:join(P, [Seed]),
+        io:format("Node ~p/10: ~p joined seed~n", [I, P])
+    end, lists:seq(1, 10-1)),
+
+    timer:sleep(3000),
+    Topo = discover_topology([Seed], false),
+    io:format("Final topology: ~p nodes, ~p links~n",
+              [length(maps:get(nodes, Topo)), length(maps:get(links, Topo))]),
     ok.
 
 test_gossip_disabled() ->
     io:format("~n=== gen_node gossip_disabled tests ===~n~n"),
-    Pid = init_tree(2, 3, test, [], asymmetric),
+    Pids = gen_node:start_grid(5, 6, test, [], asymmetric),
+    io:format("~p~n",[Pids]),
+    [Pid|_]=Pids,
     timer:sleep(100),
-    io:format("Root: ~p, peers: ~p~n", [Pid, gen_node:peers(Pid)]),
-    io:format("topology discovery:~n"),
-    discover(Pid, 6),
+    Topo = discover_topology([Pid], true),
+    io:format("Nodes: ~p~nLinks: ~p~n",
+              [length(maps:get(nodes, Topo)), length(maps:get(links, Topo))]),
+    Handlers = #{<<"get">> => {?MODULE, discover_topology, [[Pid], true]}},
+    gen_node_ws:start(Handlers, 8081),
     ok.
 
-init_tree(M, L, Mod, Args, Sym) when L > 1 ->
-    Children = [init_tree(M, L - 1, Mod, Args, Sym) || _ <- lists:seq(1, M)],
-    start_node(Children, Mod, Args, Sym);
-init_tree(_, 1, Mod, Args, _Sym) ->
-    start_node([], Mod, Args, asymmetric).
 
-start_node(Peers, Mod, Args, symmetric) ->
-    {ok, Pid} = gen_node:start_link(Mod, Args, [{gossip_enabled, false}, {peers, Peers}]),
-    [gen_node:join(Pid, [P]) || P <- Peers],
-    Pid;
-start_node(Peers, Mod, Args, asymmetric) ->
-    {ok, Pid} = gen_node:start_link(Mod, Args, [{gossip_enabled, false}, {peers, Peers}]),
-    Pid.
+%% ===================================================================
+%% Topology discovery (use ask to discover all reachable nodes)
+%% ===================================================================
 
-test_all() ->
-    test(),
-    test_gossip_disabled(),
-    ok.
+discover_topology(Seeds, Directed) ->
+    PeerMap = aggregate_peers(Seeds, #{}),
+    Nodes = [#{id => pid_to_binary(P), props => #{}}
+             || P <- maps:keys(PeerMap)],
+    Links = case Directed of
+        true  -> directed_links(PeerMap);
+        false -> undirected_links(PeerMap)
+    end,
+    NC = length(Nodes),
+    LC = length(Links),
+    Mode = case Directed of true -> "directed"; false -> "undirected" end,
+    Info = list_to_binary(io_lib:format("~p nodes, ~p links (~s)", [NC, LC, Mode])),
+    #{nodes => Nodes, links => Links, info => Info}.
 
-%% 拓扑发现：通过 ask 遍历所有可达节点
-%% Root: 任意已知节点 PID
-%% TTL:  搜索深度
-discover(Root, TTL) ->
-    case gen_node:ask(Root, get_peers, TTL, 5000) of
-        {ok, Replies} ->
-            Nodes = lists:usort([P || {P, _} <- Replies]),
-            Links = lists:usort(lists:flatmap(
-                fun({P, Ps}) -> [{P, Q} || Q <- Ps, Q =/= P] end, Replies)),
-            io:format("Nodes (~p):~n", [length(Nodes)]),
-            [io:format("  ~p~n", [N]) || N <- Nodes],
-            io:format("Links (~p):~n", [length(Links)]),
-            [io:format("  ~p -- ~p~n", [A, B]) || {A, B} <- Links],
-            #{nodes => Nodes, links => Links}
-    end.
+directed_links(PeerMap) ->
+    [#{from => pid_to_binary(P), to => pid_to_binary(Q), props => #{}}
+     || {P, Peers} <- maps:to_list(PeerMap), Q <- Peers, Q =/= P].
+
+undirected_links(PeerMap) ->
+    Pairs = [{P, Q} || {P, Peers} <- maps:to_list(PeerMap), Q <- Peers, Q =/= P],
+    DedupSet = lists:foldl(
+        fun({P, Q}, S) ->
+            Key = if P < Q -> {P, Q}; true -> {Q, P} end,
+            sets:add_element(Key, S)
+        end, sets:new(), Pairs),
+    [#{from => pid_to_binary(P1), to => pid_to_binary(P2), props => #{}}
+     || {P1, P2} <- sets:to_list(DedupSet)].
+
+aggregate_peers([Seed | Rest], Acc) ->
+    Peers = case gen_node:ask(Seed, get_peers, 20, 1000) of
+        {ok, Replies} -> Replies;
+        _ -> [{Seed, gen_node:peers(Seed)}]
+    end,
+    Acc2 = lists:foldl(fun({P, Ps}, M) ->
+        maps:put(P, Ps, M)
+    end, Acc, Peers),
+    aggregate_peers(Rest, Acc2);
+aggregate_peers([], Acc) -> Acc.
+
+pid_to_binary(Pid) ->
+    list_to_binary(pid_to_list(Pid)).
