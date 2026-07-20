@@ -214,13 +214,13 @@ test_gossip_disabled() ->
     [y, x] = S3#state.casts,
     io:format("  PASSED~n~n"),
 
-    %% Test GD5: gossip is silently ignored when disabled
-    io:format("Test GD5: gossip ignored when disabled~n"),
-    ok = gen_node:gossip(G1, {should_not_spread, "data"}),
+    %% Test GD5: gossip works even when gossip_enabled=false
+    io:format("Test GD5: gossip works with gossip_enabled=false~n"),
+    ok = gen_node:gossip(G1, {should_spread, "data"}),
     timer:sleep(500),
     S2b = gen_node:call(G2, get_state),
-    io:format("  G2 gossips = ~p (should be empty)~n", [S2b#state.gossips]),
-    [] = S2b#state.gossips,
+    io:format("  G2 gossips = ~p~n", [S2b#state.gossips]),
+    true = lists:keymember({should_spread, "data"}, 2, S2b#state.gossips),
     io:format("  PASSED~n~n"),
 
     %% Test GD6: stop works

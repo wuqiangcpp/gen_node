@@ -37,10 +37,20 @@ websocket_init(State) ->
     {[], State, hibernate}.
 
 websocket_handle({text, Msg}, State = #ws_state{handlers = Hs}) ->
-    Result = case maps:find(Msg, Hs) of
-        {ok, {M, F, A}} -> apply(M, F, A);
-        {ok, Fun} when is_function(Fun) -> Fun();
-        error -> #{error => <<"unknown command">>}
+    Result = try
+        Map = jsx:decode(Msg, [return_maps]),
+        Cmd = maps:get(<<"cmd">>, Map),
+        Args = case maps:get(<<"value">>, Map, undefined) of
+            undefined -> [];
+            V -> [V]
+        end,
+        case maps:find(Cmd, Hs) of
+            {ok, {M, F, A}} -> apply(M, F, A ++ Args);
+            {ok, Fun} when is_function(Fun) -> Fun();
+            error -> #{error => <<"unknown command: ", Cmd/binary>>}
+        end
+    catch _:_ ->
+        #{error => <<"invalid json">>}
     end,
     {reply, {text, jsx:encode(Result)}, State};
 websocket_handle(_Frame, State) ->

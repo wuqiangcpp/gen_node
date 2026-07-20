@@ -34,7 +34,8 @@
 -export([join/2, leave/1, peers/1]).
 -export([register_name/2, whereis_name/1]).
 -export([local_peers/0]).
--export([start_tree/5, start_line/4, start_grid/5]).
+-export([send_interval/3, cancel_timer/2]).
+-export([start_tree/5, start_tree/6, start_line/4, start_line/5, start_grid/5, start_grid/6]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -98,6 +99,14 @@ whereis_name(Name) ->
         Pid when is_pid(Pid) -> Pid
     end.
 
+-spec send_interval(pid(), non_neg_integer(), term()) -> reference().
+send_interval(Pid, Time, Msg) ->
+    gen_server:call(Pid, {send_interval, Time, Msg}).
+
+-spec cancel_timer(pid(), reference()) -> ok.
+cancel_timer(Pid, Ref) ->
+    gen_server:cast(Pid, {cancel_timer, Ref}).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -136,7 +145,7 @@ init([Mod, Args, Options]) ->
             State = #gen_node_state{
                 mod = Mod, mod_state = ModState, name = Name,
                 active_peers = InitialActive, passive_peers = #{},
-                seen = #{}, asks = #{}, ask_routes = #{},
+                seen = #{}, asks = #{}, ask_routes = #{}, timers = #{},
                 gossip_interval = GI, fanout = Fanout, ttl = Ttl,
                 active_view_size = AVS, passive_view_size = PVS,
                 shuffle_interval = SI, shuffle_fanout = SF, shuffle_ttl = ST,
@@ -206,6 +215,11 @@ handle_call({ask, Query, TTL, Timeout}, From, State) ->
               _ = [P ! {ask_forward, AskId, Self, Query, TTL, Self} || P <- FP],
               {noreply, St1#gen_node_state{asks = Asks}}
     end;
+handle_call({send_interval, Time, Msg}, _From, State) ->
+    Ref = make_ref(),
+    TRef = erlang:send_after(Time, self(), {send_interval_tick, Ref, Time, Msg}),
+    Timers = (State#gen_node_state.timers)#{Ref => TRef},
+    {reply, Ref, State#gen_node_state{timers = Timers}};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -270,6 +284,15 @@ handle_cast(leave, State) ->
     case State#gen_node_state.shuffle_timer of undefined -> ok; R2 -> erlang:cancel_timer(R2) end,
     {noreply, State#gen_node_state{active_peers = #{}, passive_peers = #{},
                                    gossip_timer = undefined, shuffle_timer = undefined}};
+handle_cast({cancel_timer, Ref}, State) ->
+    Timers = State#gen_node_state.timers,
+    case Timers of
+        #{Ref := TRef} ->
+            erlang:cancel_timer(TRef),
+            {noreply, State#gen_node_state{timers = maps:remove(Ref, Timers)}};
+        _ ->
+            {noreply, State}
+    end;
 handle_cast(stop, State) -> {stop, normal, State};
 handle_cast(_Msg, State) -> {noreply, State}.
 
@@ -354,17 +377,18 @@ handle_info({gossip_join, FromPid}, State) ->
     Pas = State#gen_node_state.passive_peers,
     NewInfo = #peer_info{status = alive, heartbeat = 0,
                          incarnation = erlang:system_time(second), last_seen = CT},
-    %% Add to passive first
     Pas1 = Pas#{FromPid => NewInfo},
-    %% Try to promote to active if there's room
-    {Act1, Pas2} = try_promote(FromPid, NewInfo, Act, Pas1, State),
+    {Act1, Pas2, Evicted} = try_promote_evict(FromPid, NewInfo, Act, Pas1, State),
+    _ = case Evicted of undefined -> ok; EPid -> EPid ! {disconnect, Self} end,
     Pas3 = maps:remove(Self, trim_passive(Pas2, State)),
-    %% Reply with our active view
     FromPid ! {gossip_join_reply, Self, Act1},
-    %% Forward join to active peers
-    ForwardPeers = [P || P <- maps:keys(Act1), P =/= FromPid, P =/= Self],
     STTL = State#gen_node_state.shuffle_ttl,
-    _ = [P ! {forward_join, Self, FromPid, STTL} || P <- ForwardPeers],
+    ForwardPeers = [P || P <- maps:keys(Act1), P =/= FromPid, P =/= Self],
+    case ForwardPeers of
+        [] -> ok;
+        _ -> lists:nth(rand:uniform(length(ForwardPeers)), ForwardPeers) !
+                 {forward_join, Self, FromPid, STTL}
+    end,
     {noreply, State#gen_node_state{active_peers = Act1, passive_peers = Pas3}};
 
 %% gossip_join_reply: seed's active view comes back
@@ -377,7 +401,8 @@ handle_info({gossip_join_reply, FromPid, RemoteActive}, State) ->
     CT = erlang:system_time(millisecond),
     SeedInfo = #peer_info{status = alive, heartbeat = 0,
                           incarnation = erlang:system_time(second), last_seen = CT},
-    {Act1, Pas1} = try_promote(FromPid, SeedInfo, Act, Pas0, State),
+    {Act1, Pas1, Evicted} = try_promote_evict(FromPid, SeedInfo, Act, Pas0, State),
+    _ = case Evicted of undefined -> ok; EPid -> EPid ! {disconnect, Self} end,
     {Act2, Pas2} = maps:fold(fun(Pid, _, {A, P}) ->
         case maps:is_key(Pid, A) orelse Pid =:= Self of
             true -> {A, P};
@@ -400,12 +425,17 @@ handle_info({forward_join, _OrigPid, NewPid, TTL}, State) ->
             Info = #peer_info{status = alive, heartbeat = 0,
                               incarnation = erlang:system_time(second), last_seen = CT},
             Pas0 = State#gen_node_state.passive_peers,
-            {Act1, Pas1} = try_promote(NewPid, Info, Act, Pas0, State),
+            {Act1, Pas1, Evicted} = try_promote_evict(NewPid, Info, Act, Pas0, State),
+            _ = case Evicted of undefined -> ok; EPid -> EPid ! {disconnect, Self} end,
             Pas2 = maps:remove(Self, trim_passive(Pas1, State)),
             case TTL > 0 of
                 true ->
                     FwdPeers = [P || P <- maps:keys(Act1), P =/= NewPid, P =/= Self],
-                    _ = [P ! {forward_join, Self, NewPid, TTL - 1} || P <- FwdPeers],
+                    case FwdPeers of
+                        [] -> ok;
+                        _ -> lists:nth(rand:uniform(length(FwdPeers)), FwdPeers) !
+                                 {forward_join, Self, NewPid, TTL - 1}
+                    end,
                     {noreply, State#gen_node_state{active_peers = Act1, passive_peers = Pas2}};
                 false ->
                     {noreply, State#gen_node_state{active_peers = Act1, passive_peers = Pas2}}
@@ -433,6 +463,19 @@ handle_info({gossip_leave, FromPid}, State) ->
     %% Fill active slot from passive
     {Act1, Pas1} = fill_active_view(Act, Pas, State),
     {noreply, State#gen_node_state{active_peers = Act1, passive_peers = trim_passive(Pas1, State)}};
+
+%% disconnect: evicted from a peer's active view
+handle_info({disconnect, FromPid}, State) ->
+    Self = self(),
+    Act = State#gen_node_state.active_peers,
+    Pas = State#gen_node_state.passive_peers,
+    case maps:take(FromPid, Act) of
+        {Info, Act2} ->
+            Pas2 = maps:remove(Self, Pas#{FromPid => Info}),
+            {noreply, State#gen_node_state{active_peers = Act2, passive_peers = trim_passive(Pas2, State)}};
+        error ->
+            {noreply, State}
+    end;
 
 %% shuffle: exchange passive views for diversity
 handle_info({shuffle_req, _, _, _}, #gen_node_state{gossip_enabled = false} = State) ->
@@ -499,8 +542,6 @@ handle_info({deliver_broadcast, FromPid, Data}, State) ->
         false -> {noreply, State}
     end;
 %% gossip_forward: epidemic data spread
-handle_info({gossip_forward, _, _, _, _}, #gen_node_state{gossip_enabled = false} = State) ->
-    {noreply, State};
 handle_info({gossip_forward, MsgId, OrigPid, Data, TTL}, State) ->
     Seen = State#gen_node_state.seen,
     CT = erlang:system_time(second),
@@ -620,6 +661,21 @@ handle_info({gossip_ack, _Ref, FromPid}, State) ->
             {noreply, State#gen_node_state{active_peers = Act#{FromPid => Upd}}};
         error -> {noreply, State}
     end;
+handle_info({send_interval_tick, Ref, Time, Msg}, State) ->
+    TRef = erlang:send_after(Time, self(), {send_interval_tick, Ref, Time, Msg}),
+    St = State#gen_node_state{timers = (State#gen_node_state.timers)#{Ref => TRef}},
+    try Mod = St#gen_node_state.mod,
+        put('$gn_peers', maps:keys(St#gen_node_state.active_peers)),
+        try case Mod:handle_info(Msg, St#gen_node_state.mod_state) of
+                {noreply, NMS} -> {noreply, St#gen_node_state{mod_state = NMS}};
+                {stop, R, NMS} -> {stop, R, St#gen_node_state{mod_state = NMS}}
+            end
+        after erase('$gn_peers') end
+    catch Class:Err:ST ->
+        error_logger:error_msg("gen_node: handle_info ~p crashed ~p:~p~n~p~n",
+            [Msg, Class, Err, ST]),
+        {noreply, St}
+    end;
 %% default: pass to user callback
 handle_info(Info, State) ->
     try Mod = State#gen_node_state.mod,
@@ -647,6 +703,7 @@ terminate(Reason, State) ->
     lists:foreach(fun(T) ->
         case T of undefined -> ok; Ref -> erlang:cancel_timer(Ref) end
     end, [State#gen_node_state.gossip_timer, State#gen_node_state.shuffle_timer]),
+    _ = [erlang:cancel_timer(TRef) || {_, TRef} <- maps:to_list(State#gen_node_state.timers)],
     case State#gen_node_state.name of
         undefined -> ok;
         N -> global:unregister_name(N)
@@ -753,6 +810,25 @@ try_promote(Pid, Info, Act, Pas, State) ->
         false -> {Act, Pas#{Pid => Info}}
     end.
 
+try_promote_evict(Pid, Info, Act, Pas, State) ->
+    Max = State#gen_node_state.active_view_size,
+    case map_size(Act) < Max of
+        true ->
+            {Act#{Pid => Info}, maps:remove(Pid, Pas), undefined};
+        false ->
+            EvictList = [P || {P, _} <- maps:to_list(Act), P =/= Pid],
+            case EvictList of
+                [] -> {Act, Pas, undefined};
+                _ ->
+                    EvictPid = lists:nth(rand:uniform(length(EvictList)), EvictList),
+                    EvictInfo = maps:get(EvictPid, Act),
+                    Act2 = maps:remove(EvictPid, Act),
+                    Pas2 = maps:remove(Pid, Pas#{EvictPid => EvictInfo}),
+                    Pas3 = trim_passive(Pas2, State),
+                    {Act2#{Pid => Info}, Pas3, EvictPid}
+            end
+    end.
+
 fill_active_view(Act, Pas, State) ->
     Max = State#gen_node_state.active_view_size,
     ActSize = map_size(Act),
@@ -846,37 +922,45 @@ local_peers() ->
 %%%===================================================================
 
 %% Tree: M-ary of depth L, return root of the tree
-start_tree(M, L, Mod, Args, Sym) when L > 1 ->
-    Children = [start_tree(M, L - 1, Mod, Args, Sym) || _ <- lists:seq(1, M)],
-    start_node(Children, Mod, Args, Sym);
-start_tree(_, 1, Mod, Args, Sym) ->
-    start_node([], Mod, Args, Sym).
+start_tree(M, L, Mod, Args, Sym) ->
+    start_tree(M, L, Mod, Args, Sym, []).
+start_tree(M, L, Mod, Args, Sym, GenNodeOpts) when L > 1 ->
+    Children = [start_tree(M, L - 1, Mod, Args, Sym, GenNodeOpts) || _ <- lists:seq(1, M)],
+    start_node(Children, Mod, Args, Sym, GenNodeOpts);
+start_tree(_, 1, Mod, Args, Sym, _GenNodeOpts) ->
+    start_node([], Mod, Args, Sym, []).
 
 %% Line: chain of M nodes, return a list of all nodes
 start_line(M, Mod, Args, Sym) ->
+    start_line(M, Mod, Args, Sym, []).
+start_line(M, Mod, Args, Sym, GenNodeOpts) ->
     lists:foldl(fun(_, []) ->
-        [start_node([], Mod, Args, Sym)];
+        [start_node([], Mod, Args, Sym, GenNodeOpts)];
     (_, [H | _] = L) ->
-        [start_node([H], Mod, Args, Sym) | L]
+        [start_node([H], Mod, Args, Sym, GenNodeOpts) | L]
     end, [], lists:seq(1, M)).
 
 %% Grid: M rows × N columns, return M nodes in last column
 start_grid(M, N, Mod, Args, Sym) ->
-    lists:foldl(fun(_, []) -> start_line(M, Mod, Args, Sym);
-                   (_, FL) -> start_line_with_line(FL, Mod, Args, Sym)
+    start_grid(M, N, Mod, Args, Sym, []).
+start_grid(M, N, Mod, Args, Sym, GenNodeOpts) ->
+    lists:foldl(fun(_, []) -> start_line(M, Mod, Args, Sym, GenNodeOpts);
+                   (_, FL) -> start_line_with_line(FL, Mod, Args, Sym, GenNodeOpts)
                 end, [], lists:seq(1, N)).
 
-start_line_with_line(FL, Mod, Args, Sym) ->
+start_line_with_line(FL, Mod, Args, Sym, GenNodeOpts) ->
     lists:foldl(fun(F, []) ->
-        [start_node([F], Mod, Args, Sym)];
+        [start_node([F], Mod, Args, Sym, GenNodeOpts)];
     (F, [H | _] = L) ->
-        [start_node([H, F], Mod, Args, Sym) | L]
+        [start_node([H, F], Mod, Args, Sym, GenNodeOpts) | L]
     end, [], FL).
 
-start_node(Peers, Mod, Args, symmetric) ->
-    {ok, Pid} = start_link(Mod, Args, [{gossip_enabled, false}, {peers, Peers}]),
+start_node(Peers, Mod, Args, symmetric, GenNodeOpts) ->
+    Opts = [{gossip_enabled, false}, {peers, Peers} | GenNodeOpts],
+    {ok, Pid} = start_link(Mod, Args, Opts),
     [join(Pid, [P]) || P <- Peers],
     Pid;
-start_node(Peers, Mod, Args, asymmetric) ->
-    {ok, Pid} = start_link(Mod, Args, [{gossip_enabled, false}, {peers, Peers}]),
+start_node(Peers, Mod, Args, asymmetric, GenNodeOpts) ->
+    Opts = [{gossip_enabled, false}, {peers, Peers} | GenNodeOpts],
+    {ok, Pid} = start_link(Mod, Args, Opts),
     Pid.

@@ -32,7 +32,8 @@
     gossip_enabled :: boolean(),
     suspect_timeout :: non_neg_integer(),
     dead_timeout :: non_neg_integer(),
-    seen_ttl :: non_neg_integer()
+    seen_ttl :: non_neg_integer(),
+    timers :: #{reference() => reference()}
 }).
 
 -endif.

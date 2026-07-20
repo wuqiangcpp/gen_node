@@ -45,25 +45,60 @@
     <script type="text/javascript">
       var ws;
       function getRelations() {
-	  ws.send("get");
+	  ws.send(JSON.stringify({cmd: "get"}));
       }
       var container = document.getElementById("mynetwork");
       var options = {};
-      var network= new vis.Network(container,{}, options);	  
+      var network= new vis.Network(container,{}, options);
+      var nodes = new vis.DataSet();
+      var edges = new vis.DataSet();
+      network.setData({nodes: nodes, edges: edges});
+
+      function enable_physics_once() {
+          network.setOptions({physics: {enabled: true}});
+          network.once("stabilized", function() {
+              network.setOptions({physics: {enabled: false}});
+          });
+      }
+
+      function update_nodes_from_data(dataJson) {
+          var positions = network.getPositions();
+          var existingIds = Object.keys(positions);
+          var currentIds = dataJson.nodes.map(function(n) { return n.id; });
+
+          if (currentIds.some(function(id) { return existingIds.indexOf(id) === -1; })) {
+              enable_physics_once();
+          }
+
+          dataJson.nodes.forEach(function(n){
+              var pos = positions[n.id] || {};
+              nodes.update({id: n.id, label: n.id, x: pos.x, y: pos.y, color: "#D2E5FF"});
+          });
+
+          nodes.forEach(function(n) {
+              if (currentIds.indexOf(n.id) === -1) nodes.remove(n.id);
+          });
+      }
+
+      function update_edges_from_data(dataJson) {
+          var linkIds = {};
+          dataJson.links.forEach(function(l){
+              var id = l.from + "\u2192" + l.to;
+              linkIds[id] = true;
+              edges.update({id: id, from: l.from, to: l.to});
+          });
+          edges.forEach(function(e) {
+              if (!linkIds[e.id]) edges.remove(e.id);
+          });
+      }
+
       function handle_msg(dataJson) {
 	  var directed = dataJson.info && dataJson.info.includes("(directed)");
 	  network.setOptions({edges: {arrows: {to: {enabled: directed}}}});
-	  var positions=network.getPositions();	  
-	  var nodes=dataJson.nodes.map(function(n){
-	      var pos=positions[n.id]||{};
-	      var color="#D2E5FF";
-	      return {id:n.id,label:n.id,x:pos.x,y:pos.y,color:color};
-	  });
-	  var links=dataJson.links.map(function(l){return {from:l.from, to:l.to};});
-	  var data = { nodes: new vis.DataSet(nodes), edges: new vis.DataSet(links) };
+          update_nodes_from_data(dataJson);
+          update_edges_from_data(dataJson);
 	  document.getElementById("show").innerHTML = dataJson.info;
-	  network.setData(data);
-      }      
+      }
       if ("WebSocket" in window) {
 	  // 打开一个 web socket
 	  ws = new WebSocket("ws://localhost:8081/ws");

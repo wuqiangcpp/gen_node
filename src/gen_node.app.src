@@ -4,7 +4,7 @@
     {registered, []},
     {applications, [kernel, stdlib]},
     {env, []},
-    {modules, [gen_node]},
+    {modules, [gen_node, gen_node_ws, gen_node_monitor, neuron]},
     {licenses, ["MIT"]},
     {maintainers, []}
 ]}.
