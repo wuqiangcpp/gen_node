@@ -278,10 +278,22 @@ test_ask_async() ->
     io:format("Test A4: forwarded ask routes expire on their own~n"),
     {ok, Ask4} = gen_node:ask_async(G1, whoami, 1, 300, self()),
     _ = collect(Ask4, 2000),
-    timer:sleep(5600),                       %% 300ms deadline + 5s grace
+    timer:sleep(5600),                       %% 300ms budget + 5s grace
     Routes = element(9, sys:get_state(G2)),  %% ask_routes
     io:format("  G2 ask_routes = ~p~n", [Routes]),
     0 = maps:size(Routes),
+    io:format("  PASSED~n~n"),
+
+    io:format("Test A5: cancel is local; the hop route expires by budget~n"),
+    {ok, Ask5} = gen_node:ask_async(G1, noreply_test, 1, 300, self()),
+    ok = gen_node:ask_cancel(G1, Ask5),
+    [cancelled] = collect(Ask5, 1000),
+    timer:sleep(100),                        %% let the forward reach G2
+    Routes5 = element(9, sys:get_state(G2)),
+    io:format("  G2 right after cancel = ~p~n", [Routes5]),
+    true = maps:is_key(Ask5, Routes5),
+    timer:sleep(5500),
+    0 = maps:size(element(9, sys:get_state(G2))),
     io:format("  PASSED~n~n"),
 
     ok = gen_node:stop(G1),

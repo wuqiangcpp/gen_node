@@ -54,6 +54,8 @@
 -define(DEFAULT_SHUFFLE_INTERVAL, 5000).
 -define(DEFAULT_SHUFFLE_FANOUT, 4).
 -define(DEFAULT_SHUFFLE_TTL, 3).
+%% How long a hop keeps its reply route after an ask's budget runs out.
+-define(ROUTE_GRACE, 5000).
 
 %%%===================================================================
 %%% Public API
@@ -582,11 +584,13 @@ handle_info({gossip_forward, MsgId, OrigPid, Data, TTL}, State) ->
             end
     end;
 %% ask_forward / ask_reply / ask_timeout
-handle_info({ask_forward, AskId, OrigPid, Query, TTL, FromHop}, State) ->
-    %% older senders do not carry a deadline; let the route live until their
-    %% (unknown) timeout, i.e. forever, and rely on process restarts.
-    handle_info({ask_forward, AskId, OrigPid, Query, TTL, FromHop, infinity}, State);
-handle_info({ask_forward, AskId, OrigPid, Query, TTL, FromHop, Deadline}, State) ->
+handle_info({ask_forward, _AskId, _OrigPid, _Query, _TTL, _FromHop}, State) ->
+    %% Forward without a budget (older sender). There is no way to bound the
+    %% route, and routes must not outlive their ask, so drop it. Upgrade all
+    %% nodes together.
+    {noreply, State};
+handle_info({ask_forward, AskId, OrigPid, Query, TTL, FromHop, Budget}, State) ->
+    T0 = erlang:monotonic_time(millisecond),
     Seen = State#gen_node_state.seen,
     SeenCT = erlang:system_time(second),
     case maps:is_key(AskId, Seen) of
@@ -599,7 +603,9 @@ handle_info({ask_forward, AskId, OrigPid, Query, TTL, FromHop, Deadline}, State)
             Seen2 = Seen1#{AskId => SeenCT},
             StSeen = State#gen_node_state{seen = Seen2},
             AR0 = StSeen#gen_node_state.ask_routes,
-            AR = AR0#{AskId => {FromHop, route_timer(AskId, Deadline)}},
+            AR = AR0#{AskId => FromHop},
+            _ = erlang:send_after(Budget + ?ROUTE_GRACE, self(),
+                                  {ask_route_expire, AskId}),
             St1 = StSeen#gen_node_state{ask_routes = AR},
             Mod = St1#gen_node_state.mod,
             Self = self(),
@@ -624,7 +630,8 @@ handle_info({ask_forward, AskId, OrigPid, Query, TTL, FromHop, Deadline}, State)
             APeers = maps:keys(St2#gen_node_state.active_peers),
             case TTL > 0 andalso APeers =/= [] of
                 true -> FP = select_fanout_peers(APeers, St2#gen_node_state.fanout, FromHop),
-                        _ = [P ! {ask_forward, AskId, OrigPid, Query, TTL - 1, Self, Deadline} || P <- FP],
+                        Left = max(0, Budget - (erlang:monotonic_time(millisecond) - T0)),
+                        _ = [P ! {ask_forward, AskId, OrigPid, Query, TTL - 1, Self, Left} || P <- FP],
                         {noreply, St2};
                 false -> {noreply, St2}
             end
@@ -647,7 +654,7 @@ handle_info({ask_reply, AskId, OrigPid, ReplyPid, Reply}, State) ->
             end;
         false ->
             case maps:find(AskId, State#gen_node_state.ask_routes) of
-                {ok, {HopBack, _Timer}} ->
+                {ok, HopBack} ->
                     HopBack ! {ask_reply, AskId, OrigPid, ReplyPid, Reply},
                     {noreply, State};
                 error -> {noreply, State}
@@ -892,14 +899,15 @@ select_fanout_peers(Peers, Fanout, Exclude) ->
 
 start_ask(Mode, Target, Query, TTL, Timeout, State) ->
     AskId = {erlang:unique_integer([positive]), node()},
-    %% system_time, not monotonic: the deadline travels to other nodes and
-    %% monotonic clocks have unrelated offsets.
-    Deadline = erlang:system_time(millisecond) + Timeout,
+    %% The budget travels as a relative number of milliseconds: wall clocks
+    %% differ between nodes and monotonic clocks have unrelated offsets, so
+    %% every hop starts its own route timer on receipt instead.
+    Budget = Timeout,
     Timer = erlang:send_after(Timeout, self(), {ask_timeout, AskId}),
     Self = self(),
     {SelfReplies, St1} = run_handle_ask(State#gen_node_state.mod, Self, Query, State),
     Entry = #{mode => Mode, target => Target, replies => SelfReplies,
-              timer => Timer, deadline => Deadline},
+              timer => Timer},
     St2 = St1#gen_node_state{asks = (St1#gen_node_state.asks)#{AskId => Entry}},
     St3 = notify_async(AskId, SelfReplies, St2),
     case lists:any(fun({_From, R}) -> is_final(R) end, SelfReplies) of
@@ -912,7 +920,7 @@ start_ask(Mode, Target, Query, TTL, Timeout, State) ->
                 [] -> {AskId, St3};
                 _ ->
                     FP = select_fanout_peers(Peers, St3#gen_node_state.fanout, Self),
-                    _ = [P ! {ask_forward, AskId, Self, Query, TTL, Self, Deadline} || P <- FP],
+                    _ = [P ! {ask_forward, AskId, Self, Query, TTL, Self, Budget} || P <- FP],
                     {AskId, St3}
             end
     end.
@@ -959,20 +967,13 @@ finish_ask(AskId, Reason, State) ->
             State
     end.
 
-%% Routes must disappear on their own: no hop knows when a long ask ends.
-route_timer(_AskId, infinity) ->
-    undefined;
-route_timer(AskId, Deadline) ->
-    Remaining = max(0, Deadline - erlang:system_time(millisecond)),
-    erlang:send_after(Remaining + 5000, self(), {ask_route_expire, AskId}).
-
 send_ask_reply(OrigPid, Self, AskId, Reply, State) ->
     Act = State#gen_node_state.active_peers,
     case maps:is_key(OrigPid, Act) of
         true -> OrigPid ! {ask_reply, AskId, OrigPid, Self, Reply};
         false ->
             case maps:find(AskId, State#gen_node_state.ask_routes) of
-                {ok, {HopBack, _Timer}} ->
+                {ok, HopBack} ->
                     HopBack ! {ask_reply, AskId, OrigPid, Self, Reply};
                 error -> ok
             end
