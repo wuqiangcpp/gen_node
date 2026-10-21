@@ -584,11 +584,6 @@ handle_info({gossip_forward, MsgId, OrigPid, Data, TTL}, State) ->
             end
     end;
 %% ask_forward / ask_reply / ask_timeout
-handle_info({ask_forward, _AskId, _OrigPid, _Query, _TTL, _FromHop}, State) ->
-    %% Forward without a budget (older sender). There is no way to bound the
-    %% route, and routes must not outlive their ask, so drop it. Upgrade all
-    %% nodes together.
-    {noreply, State};
 handle_info({ask_forward, AskId, OrigPid, Query, TTL, FromHop, Budget}, State) ->
     T0 = erlang:monotonic_time(millisecond),
     Seen = State#gen_node_state.seen,

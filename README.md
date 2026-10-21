@@ -190,14 +190,10 @@ immediately and delivers replies as they arrive:
   any other reply, followed by `{gen_node_ask_done, AskId, final}`.
 - `ask_cancel/2` removes the timer and closes with `cancelled`; replies already
   in flight are dropped.
-- Every hop drops its `ask_routes` entry once the ask's remaining *budget*
-  runs out, plus a 5s grace for late replies. The budget is a relative number
-  of milliseconds, not a wall-clock deadline, so clock skew between nodes can
-  never expire a route while the initiator is still listening.
-- Cancelling is local: intermediate hops keep their route until the budget
-  expires; late replies are still routed back and dropped by the initiator.
-- No mixed-version support: a forward without a budget is ignored. Upgrade
-  every node together.
+- Every hop drops its `ask_routes` entry shortly after the ask times out, so
+  routes never outlive their ask.
+- Cancelling is local: intermediate hops keep their route until it expires;
+  late replies are still routed back and dropped by the initiator.
 
 ## Neuron — Boltzmann Machine Application
 
