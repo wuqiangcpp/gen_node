@@ -4,7 +4,7 @@
 -export([init/1, handle_call/3, handle_cast/2,
          handle_broadcast/3, handle_gossip/3, handle_ask/3,
          handle_info/2, terminate/2]).
--export([test/0, test_gossip_disabled/0, test_all/0]).
+-export([test/0, test_gossip_disabled/0, test_ask_async/0, test_all/0]).
 
 -record(state, {
     calls = [],
@@ -38,7 +38,9 @@ handle_ask(From, {echo, Msg}, State) ->
 handle_ask(_From, count, _State) ->
     {reply, 0, none};
 handle_ask(_From, noreply_test, State) ->
-    {noreply, State}.
+    {noreply, State};
+handle_ask(_From, {final_answer, X}, State) ->
+    {reply, {final, X}, State}.
 
 handle_info(Info, State) ->
     {noreply, State#state{infos = [Info | State#state.infos]}}.
@@ -233,8 +235,74 @@ test_gossip_disabled() ->
     io:format("=== ALL GOSSIP_DISABLED TESTS PASSED ===~n"),
     ok.
 
+%% -- ask_async / ask_cancel ---------------------------------------------
+
+test_ask_async() ->
+    io:format("=== ask_async tests ===~n~n"),
+    {ok, G1} = gen_node:start_link(?MODULE, [], [{gossip_enabled, false}]),
+    {ok, G2} = gen_node:start_link(?MODULE, [], [{gossip_enabled, false}]),
+    ok = gen_node:join(G1, [G2]),
+    timer:sleep(100),
+
+    io:format("Test A1: async ask gets the local and the remote answer~n"),
+    {ok, Ask1} = gen_node:ask_async(G1, whoami, 1, 300, self()),
+    A1 = collect(Ask1, 2000),
+    io:format("  ~p~n", [A1]),
+    2 = length([R || {reply, _, _} = R <- A1]),
+    timeout = lists:last(A1),
+    io:format("  PASSED~n~n"),
+
+    io:format("Test A2: a final reply ends the ask early~n"),
+    T0 = erlang:monotonic_time(millisecond),
+    {ok, Ask2} = gen_node:ask_async(G1, {final_answer, 42}, 1, 5000, self()),
+    A2 = collect(Ask2, 2000),
+    Elapsed = erlang:monotonic_time(millisecond) - T0,
+    io:format("  ~p in ~pms~n", [A2, Elapsed]),
+    [{reply, _, {final, 42}}, final] = A2,
+    true = Elapsed < 1000,
+    io:format("  PASSED~n~n"),
+
+    io:format("Test A3: cancel stops the ask and its timer~n"),
+    {ok, Ask3} = gen_node:ask_async(G1, noreply_test, 1, 500, self()),
+    ok = gen_node:ask_cancel(G1, Ask3),
+    [cancelled] = collect(Ask3, 1000),
+    timer:sleep(700),
+    receive
+        {gen_node_ask_done, Ask3, Late} ->
+            io:format("  unexpected late done: ~p~n", [Late]),
+            exit(late_done)
+    after 0 -> ok
+    end,
+    io:format("  PASSED~n~n"),
+
+    io:format("Test A4: forwarded ask routes expire on their own~n"),
+    {ok, Ask4} = gen_node:ask_async(G1, whoami, 1, 300, self()),
+    _ = collect(Ask4, 2000),
+    timer:sleep(5600),                       %% 300ms deadline + 5s grace
+    Routes = element(9, sys:get_state(G2)),  %% ask_routes
+    io:format("  G2 ask_routes = ~p~n", [Routes]),
+    0 = maps:size(Routes),
+    io:format("  PASSED~n~n"),
+
+    ok = gen_node:stop(G1),
+    ok = gen_node:stop(G2),
+    timer:sleep(100),
+    io:format("=== ALL ASK_ASYNC TESTS PASSED ===~n~n"),
+    ok.
+
+collect(AskId, Timeout) ->
+    receive
+        {gen_node_ask, AskId, From, Reply} ->
+            [{reply, From, Reply} | collect(AskId, Timeout)];
+        {gen_node_ask_done, AskId, Reason} ->
+            [Reason]
+    after Timeout ->
+            [no_message]
+    end.
+
 test_all() ->
     test(),
     test_gossip_disabled(),
+    test_ask_async(),
     io:format("~n=== ALL TESTS PASSED ===~n"),
     ok.

@@ -7,6 +7,7 @@
 - **gen_server interface** — familiar `call`/`cast`/`broadcast`/`gossip`/`ask` APIs
 - **HyParView gossip** — active view (default 6) + passive view (default 100) + shuffle for diversity
 - **Epidemic `ask`** — TTL-limited query with backtrack routing and seen dedup; initiator self-ask included
+- **Async ask** — `ask_async/5` streams replies as messages, `ask_cancel/2` closes early, `{final, _}` ends it
 - **Failure detection** — periodic ping/ack with suspect → promote/dead lifecycle
 - **Fixed topology mode** — `gossip_enabled: false` disables gossip; `peers` option or `join/2` for direct topology
 - **Global name registration** — optional `register_name/2` via Erlang `global`
@@ -76,6 +77,8 @@ cast(Pid, Request)              -> ok
 broadcast(Pid, Data)            -> ok          %% direct to all peers
 gossip(Pid, Data)               -> ok          %% epidemic spread
 ask(Pid, Query, TTL, Timeout)   -> {ok, [{pid(), term()}]}
+ask_async(Pid, Query, TTL, Timeout, NotifyPid) -> {ok, AskId}
+ask_cancel(Pid, AskId)          -> ok
 ```
 
 ### Membership
@@ -171,6 +174,26 @@ When `gossip_enabled: false`:
 3. Each peer replies via backtrack routing (`ask_routes` map)
 4. Initiator collects all replies until timeout
 5. Seen dedup prevents cycles
+
+### Async ask
+
+`ask/4` is a `gen_server:call`: the caller blocks until the timeout and only
+then gets every reply collected so far. `ask_async/5` returns an `AskId`
+immediately and delivers replies as they arrive:
+
+    {gen_node_ask, AskId, FromPid, Reply}
+    {gen_node_ask_done, AskId, timeout | final | cancelled}
+
+- The initiator's own `handle_ask` answer is delivered first.
+- A reply of the form `{final, Payload}` ends the ask early — useful when the
+  target answers in chunks and knows which one is last. It is delivered like
+  any other reply, followed by `{gen_node_ask_done, AskId, final}`.
+- `ask_cancel/2` removes the timer and closes with `cancelled`; replies already
+  in flight are dropped.
+- Each hop forgets its `ask_routes` entry when the deadline carried by the
+  query expires (plus a 5s grace for late replies), so long-lived asks do not
+  leak routes. Senders of the older six-tuple `ask_forward` still work; their
+  routes never expire.
 
 ## Neuron — Boltzmann Machine Application
 

@@ -30,7 +30,7 @@
 %% Public API
 -export([start_link/3, start/3, stop/1]).
 -export([call/2, call/3, cast/2]).
--export([broadcast/2, gossip/2, ask/4]).
+-export([broadcast/2, gossip/2, ask/4, ask_async/5, ask_cancel/2]).
 -export([join/2, leave/1, peers/1]).
 -export([register_name/2, whereis_name/1]).
 -export([local_peers/0]).
@@ -82,6 +82,22 @@ gossip(Pid, Data) -> gen_server:cast(Pid, {gossip, Data}).
 -spec ask(pid(), term(), pos_integer(), timeout()) -> {ok, [{pid(), term()}]}.
 ask(Pid, Query, TTL, Timeout) ->
     gen_server:call(Pid, {ask, Query, TTL, Timeout}, Timeout + 100).
+
+%% Non-blocking ask: replies are delivered as messages while the ask is open.
+%%
+%%   {gen_node_ask, AskId, FromPid, Reply}          one per reply
+%%   {gen_node_ask_done, AskId, timeout | final | cancelled}
+%%
+%% A reply of the form `{final, Payload}' ends the ask early: the caller gets
+%% that reply and the done message, and later replies are dropped. That is how
+%% a long job says "this was the last chunk" without waiting out the timeout.
+-spec ask_async(pid(), term(), pos_integer(), timeout(), pid()) -> {ok, term()}.
+ask_async(Pid, Query, TTL, Timeout, Notify) when is_pid(Notify) ->
+    gen_server:call(Pid, {ask_async, Query, TTL, Timeout, Notify}, 5000).
+
+-spec ask_cancel(pid(), term()) -> ok.
+ask_cancel(Pid, AskId) ->
+    gen_server:call(Pid, {ask_cancel, AskId}, 5000).
 
 -spec join(pid(), [pid() | {name, term()}]) -> ok.
 join(Pid, Peers) -> gen_server:cast(Pid, {join, Peers}).
@@ -192,29 +208,15 @@ handle_call({register_name, Name}, _From, State) ->
         {no, P} -> {reply, {error, {already_registered, P}}, State}
     end;
 handle_call({ask, Query, TTL, Timeout}, From, State) ->
-    AskId = {erlang:unique_integer([positive]), node()},
-    Timer = erlang:send_after(Timeout, self(), {ask_timeout, AskId}),
-    Self = self(),
-    Mod = State#gen_node_state.mod,
-    {SelfReply, St1} = case erlang:function_exported(Mod, handle_ask, 3) of
-        true ->
-            put('$gn_peers', maps:keys(State#gen_node_state.active_peers)),
-            try case Mod:handle_ask(Self, Query, State#gen_node_state.mod_state) of
-                    {reply, R, NMS} -> {[{Self, R}], State#gen_node_state{mod_state = NMS}};
-                    {noreply, NMS}  -> {[], State#gen_node_state{mod_state = NMS}}
-                end
-            catch _:_ -> {[], State}
-            after erase('$gn_peers') end;
-        false -> {[], State}
-    end,
-    Asks = (St1#gen_node_state.asks)#{AskId => {From, SelfReply, Timer}},
-    Peers = maps:keys(St1#gen_node_state.active_peers),
-    case Peers of
-        [] -> {noreply, St1#gen_node_state{asks = Asks}};
-        _  -> FP = select_fanout_peers(Peers, St1#gen_node_state.fanout, Self),
-              _ = [P ! {ask_forward, AskId, Self, Query, TTL, Self} || P <- FP],
-              {noreply, St1#gen_node_state{asks = Asks}}
-    end;
+    {_AskId, St1} = start_ask(sync, From, Query, TTL, Timeout, State),
+    {noreply, St1};
+
+handle_call({ask_async, Query, TTL, Timeout, Notify}, _From, State) ->
+    {AskId, St1} = start_ask(async, Notify, Query, TTL, Timeout, State),
+    {reply, {ok, AskId}, St1};
+
+handle_call({ask_cancel, AskId}, _From, State) ->
+    {reply, ok, finish_ask(AskId, cancelled, State)};
 handle_call({send_interval, Time, Msg}, _From, State) ->
     Ref = make_ref(),
     TRef = erlang:send_after(Time, self(), {send_interval_tick, Ref, Time, Msg}),
@@ -581,6 +583,10 @@ handle_info({gossip_forward, MsgId, OrigPid, Data, TTL}, State) ->
     end;
 %% ask_forward / ask_reply / ask_timeout
 handle_info({ask_forward, AskId, OrigPid, Query, TTL, FromHop}, State) ->
+    %% older senders do not carry a deadline; let the route live until their
+    %% (unknown) timeout, i.e. forever, and rely on process restarts.
+    handle_info({ask_forward, AskId, OrigPid, Query, TTL, FromHop, infinity}, State);
+handle_info({ask_forward, AskId, OrigPid, Query, TTL, FromHop, Deadline}, State) ->
     Seen = State#gen_node_state.seen,
     SeenCT = erlang:system_time(second),
     case maps:is_key(AskId, Seen) of
@@ -593,7 +599,7 @@ handle_info({ask_forward, AskId, OrigPid, Query, TTL, FromHop}, State) ->
             Seen2 = Seen1#{AskId => SeenCT},
             StSeen = State#gen_node_state{seen = Seen2},
             AR0 = StSeen#gen_node_state.ask_routes,
-            AR = AR0#{AskId => FromHop},
+            AR = AR0#{AskId => {FromHop, route_timer(AskId, Deadline)}},
             St1 = StSeen#gen_node_state{ask_routes = AR},
             Mod = St1#gen_node_state.mod,
             Self = self(),
@@ -618,7 +624,7 @@ handle_info({ask_forward, AskId, OrigPid, Query, TTL, FromHop}, State) ->
             APeers = maps:keys(St2#gen_node_state.active_peers),
             case TTL > 0 andalso APeers =/= [] of
                 true -> FP = select_fanout_peers(APeers, St2#gen_node_state.fanout, FromHop),
-                        _ = [P ! {ask_forward, AskId, OrigPid, Query, TTL - 1, Self} || P <- FP],
+                        _ = [P ! {ask_forward, AskId, OrigPid, Query, TTL - 1, Self, Deadline} || P <- FP],
                         {noreply, St2};
                 false -> {noreply, St2}
             end
@@ -628,27 +634,30 @@ handle_info({ask_reply, AskId, OrigPid, ReplyPid, Reply}, State) ->
     case Self =:= OrigPid of
         true ->
             case maps:find(AskId, State#gen_node_state.asks) of
-                {ok, {From, Replies, Timer}} ->
-                    Asks0 = State#gen_node_state.asks,
-                    Asks = Asks0#{AskId => {From, [{ReplyPid, Reply} | Replies], Timer}},
-                    {noreply, State#gen_node_state{asks = Asks}};
+                {ok, #{replies := Replies0} = Entry} ->
+                    Entry1 = Entry#{replies := [{ReplyPid, Reply} | Replies0]},
+                    Asks = (State#gen_node_state.asks)#{AskId => Entry1},
+                    St1 = notify_async(AskId, [{ReplyPid, Reply}],
+                                       State#gen_node_state{asks = Asks}),
+                    case Reply of
+                        {final, _} -> {noreply, finish_ask(AskId, final, St1)};
+                        _ -> {noreply, St1}
+                    end;
                 error -> {noreply, State}
             end;
         false ->
             case maps:find(AskId, State#gen_node_state.ask_routes) of
-                {ok, HopBack} ->
+                {ok, {HopBack, _Timer}} ->
                     HopBack ! {ask_reply, AskId, OrigPid, ReplyPid, Reply},
                     {noreply, State};
                 error -> {noreply, State}
             end
     end;
 handle_info({ask_timeout, AskId}, State) ->
-    case maps:find(AskId, State#gen_node_state.asks) of
-        {ok, {From, Replies, _Timer}} ->
-            gen_server:reply(From, {ok, lists:reverse(Replies)}),
-            {noreply, State#gen_node_state{asks = maps:remove(AskId, State#gen_node_state.asks)}};
-        error -> {noreply, State}
-    end;
+    {noreply, finish_ask(AskId, timeout, State)};
+handle_info({ask_route_expire, AskId}, State) ->
+    {noreply, State#gen_node_state{
+                ask_routes = maps:remove(AskId, State#gen_node_state.ask_routes)}};
 %% ping/ack for failure detection
 handle_info({gossip_ping, Ref, FromPid}, State) ->
     FromPid ! {gossip_ack, Ref, self()}, {noreply, State};
@@ -879,13 +888,92 @@ select_fanout_peers(Peers, Fanout, Exclude) ->
             lists:sublist(Shuffled, Fanout)
     end.
 
+%% -- ask internals -------------------------------------------------------
+
+start_ask(Mode, Target, Query, TTL, Timeout, State) ->
+    AskId = {erlang:unique_integer([positive]), node()},
+    %% system_time, not monotonic: the deadline travels to other nodes and
+    %% monotonic clocks have unrelated offsets.
+    Deadline = erlang:system_time(millisecond) + Timeout,
+    Timer = erlang:send_after(Timeout, self(), {ask_timeout, AskId}),
+    Self = self(),
+    {SelfReplies, St1} = run_handle_ask(State#gen_node_state.mod, Self, Query, State),
+    Entry = #{mode => Mode, target => Target, replies => SelfReplies,
+              timer => Timer, deadline => Deadline},
+    St2 = St1#gen_node_state{asks = (St1#gen_node_state.asks)#{AskId => Entry}},
+    St3 = notify_async(AskId, SelfReplies, St2),
+    case lists:any(fun({_From, R}) -> is_final(R) end, SelfReplies) of
+        true ->
+            %% our own answer was final; no point asking the peers
+            {AskId, finish_ask(AskId, final, St3)};
+        false ->
+            Peers = maps:keys(St3#gen_node_state.active_peers),
+            case Peers of
+                [] -> {AskId, St3};
+                _ ->
+                    FP = select_fanout_peers(Peers, St3#gen_node_state.fanout, Self),
+                    _ = [P ! {ask_forward, AskId, Self, Query, TTL, Self, Deadline} || P <- FP],
+                    {AskId, St3}
+            end
+    end.
+
+is_final({final, _}) -> true;
+is_final(_) -> false.
+
+run_handle_ask(Mod, Self, Query, State) ->
+    case erlang:function_exported(Mod, handle_ask, 3) of
+        true ->
+            put('$gn_peers', maps:keys(State#gen_node_state.active_peers)),
+            try case Mod:handle_ask(Self, Query, State#gen_node_state.mod_state) of
+                    {reply, R, NMS} -> {[{Self, R}], State#gen_node_state{mod_state = NMS}};
+                    {noreply, NMS}  -> {[], State#gen_node_state{mod_state = NMS}}
+                end
+            catch _:_ -> {[], State}
+            after erase('$gn_peers') end;
+        false ->
+            {[], State}
+    end.
+
+notify_async(AskId, Replies, State) ->
+    case maps:find(AskId, State#gen_node_state.asks) of
+        {ok, #{mode := async, target := Notify}} ->
+            _ = [Notify ! {gen_node_ask, AskId, From, Reply} || {From, Reply} <- Replies],
+            State;
+        _ ->
+            State
+    end.
+
+%% Close an ask: the sync caller gets its collected replies, the async caller
+%% gets a done message. Safe to call twice.
+finish_ask(AskId, Reason, State) ->
+    case maps:take(AskId, State#gen_node_state.asks) of
+        {#{mode := sync, target := From, replies := Replies, timer := Timer}, Asks} ->
+            _ = erlang:cancel_timer(Timer),
+            gen_server:reply(From, {ok, lists:reverse(Replies)}),
+            State#gen_node_state{asks = Asks};
+        {#{mode := async, target := Notify, timer := Timer}, Asks} ->
+            _ = erlang:cancel_timer(Timer),
+            Notify ! {gen_node_ask_done, AskId, Reason},
+            State#gen_node_state{asks = Asks};
+        error ->
+            State
+    end.
+
+%% Routes must disappear on their own: no hop knows when a long ask ends.
+route_timer(_AskId, infinity) ->
+    undefined;
+route_timer(AskId, Deadline) ->
+    Remaining = max(0, Deadline - erlang:system_time(millisecond)),
+    erlang:send_after(Remaining + 5000, self(), {ask_route_expire, AskId}).
+
 send_ask_reply(OrigPid, Self, AskId, Reply, State) ->
     Act = State#gen_node_state.active_peers,
     case maps:is_key(OrigPid, Act) of
         true -> OrigPid ! {ask_reply, AskId, OrigPid, Self, Reply};
         false ->
             case maps:find(AskId, State#gen_node_state.ask_routes) of
-                {ok, HopBack} -> HopBack ! {ask_reply, AskId, OrigPid, Self, Reply};
+                {ok, {HopBack, _Timer}} ->
+                    HopBack ! {ask_reply, AskId, OrigPid, Self, Reply};
                 error -> ok
             end
     end.
